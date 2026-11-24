@@ -231,27 +231,36 @@ The ASIC communicates with the **RP2350** over **two independent Dual SPI links*
 
 ### Dual SPI #1: Host-to-ASIC Control & TX Stream (RP2350 = Master)
 
-The RP2350 uses **Dual SPI #1** for all writes into the ASIC—loading microcode instructions into either core as well as streaming outgoing payload/phase data into the TX FIFO. Because each transaction begins with a target address, the bus decoder routes incoming words automatically without parsing opcodes or needing burst-length counters.
+The RP2350 uses **Dual SPI #1** (`SCK`, `CS_n`, `IO[1:0]`, 2 bits per `SCK` cycle) for all writes into the ASIC—loading microcode instructions into Core 1 (TX) or Core 2 (RX), updating control/status settings, and streaming outgoing payload/phase words into the TX FIFO.
 
-#### Address Map
+Instead of sending a full address word on every burst or spending `PC` control bits inside every data burst, each `CS_n`-bounded burst begins with a **2-bit burst-mode header** on the first Dual-SPI clock cycle (`1` `SCK` edge × `2` lanes = `2` bits). A small header FSM latches these first 2 bits and hands subsequent clocks to a **Serial-In Parallel-Out (SIPO)** shift register.
 
-| Address Range (Example) | Target Block | Data Width & Format | Behavior on Write |
+#### Burst Mode Enumeration (First 2 Bits on `CS_n` Low)
+
+| Header Bits (`IO[1:0]` on Clock 1) | Mode | Target / Behavior | `PC` & SIPO Handling |
 | --- | --- | --- | --- |
-| **`0x0000 – 0x0FFF`** | **Core 1 (TX) Instruction Memory** | 16-bit instruction word | Writes to addressed slot; auto-increments write pointer during burst writes |
-| **`0x1000 – 0x1FFF`** | **Core 2 (RX) Instruction Memory** | 16-bit instruction word | Writes to addressed slot; auto-increments write pointer during burst writes |
-| **`0x2000 – 0x2FFF`** | **Control / Status Registers** | 16-bit register word | Core start/reset, soft clear, FIFO watermark/timeout thresholds |
-| **`0x3000+`** | **TX FIFO (Core 1 Payload)** | 8-bit or 16-bit framed / `DUAL_LANE` words | Pushes directly into the TX FIFO; ignores address increment so long bursts stream continuously |
+| **`2'b00`** | **TX Data Stream** | Routes payload words directly into **TX FIFO** (`FIFO1`) | No `PC` control bits in stream; SIPO assembles full payload words cleanly |
+| **`2'b01`** | **TX Instruction Load** | Writes instruction words into **Core 1 Instruction Memory** (`IMEM1`) | **Automatic `PC` hold** while writing; resets/arms `PC` to `0` on burst completion (`CS_n` high) or core start |
+| **`2'b10`** | **RX Instruction Load** | Writes instruction words into **Core 2 Instruction Memory** (`IMEM2`) | **Automatic `PC` hold** while writing; resets/arms `PC` to `0` on burst completion (`CS_n` high) or core start |
+| **`2'b11`** | **Control / CSR Write** | Updates control/status registers (run/enable, clear, watermarks/timeouts) | Explicit configuration path without polluting data bursts |
+
+#### Why We Chose This Approach
+
+* **Low overhead on small, frequent data bursts:** Because `TX_FIFO` depth is constrained in a 32-tile (~32K logic cell) budget, the RP2350 sends frequent, relatively small bursts rather than huge transfers. Embedding `PC` control bits inside every burst or every word would waste payload bits and add packing work on the RP2350.
+* **Automatic `PC` hold and reset during instruction loads:** Holding `PC` automatically while loading `IMEM1` or `IMEM2` prevents the sequencer from executing half-written instructions, and resetting `PC` to `0` when instruction loading finishes keeps startup simple without needing manual hold/unhold commands on every burst.
+* **Clean `CS_n` framing and FSM + SIPO split:** `CS_n` stays strictly as burst framing (`low` = active burst, `high` = burst end). A minimal FSM decodes the initial **2 bits** on clock 1, while the **SIPO** shift register shifts remaining bits into parallel words without overloading `CS_n` or adding extra sideband pins.
 
 #### Transaction Frame (Dual SPI #1)
 
-```
-[ CS_n Low ] -> [ 16-bit Address (8 Dual-SPI clocks) ] -> [ N x 16-bit Data Words (8 clocks each) ] -> [ CS_n High ]
+```text
+[ CS_n Low ] -> [ 2-bit Burst Header (1st Dual-SPI Clock) ] -> [ SIPO Parallel Words (N clocks per word) ] -> [ CS_n High ]
 
 ```
 
-1. **Address Phase:** The RP2350 asserts `CS_n` low and clocks out a **16-bit target address** across `IO[1:0]` (2 bits per `SCK` cycle = 8 cycles).
-2. **Data Phase:** Subsequent 16-bit words (`8` Dual SPI clocks each) write sequentially into the selected instruction memory or push continuously into the **TX FIFO** until `CS_n` returns high.
-3. **Flow Control:** A dedicated `TX_FIFO_READY` (or `TX_FIFO_FULL`) status pin lets the RP2350 pause burst streaming before overflowing the TX FIFO.
+1. **Header Capture (Clock 1):** When `CS_n` goes low, the FSM resets its bit counter and samples the first **2 bits** on `IO[1:0]` to select the burst mode (`2'b00`–`2'b11`) and assert automatic `PC` hold for instruction bursts (`2'b01` / `2'b10`).
+2. **SIPO Assembly & Routing (`CS_n` Low):** Subsequent `SCK` edges shift bits into the SIPO shift register and route completed words to `FIFO1`, `IMEM1`, `IMEM2`, or control registers according to the latched 2-bit mode.
+3. **Burst End (`CS_n` High):** Raising `CS_n` ends the burst, resets the header FSM for the next transaction, and triggers the automatic `PC` reset-to-`0` action for completed instruction-load bursts without wiping `IMEM` or unread `FIFO1` contents.
+4. **Flow Control:** A `TX_FIFO_READY` (or `TX_FIFO_FULL`) indicator lets the RP2350 pause burst streaming before overflowing `TX_FIFO`.
 
 ### Dual SPI #2: ASIC-to-Host RX Data Stream (`[PF-5]`)
 
